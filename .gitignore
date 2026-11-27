@@ -1,0 +1,4 @@
+__pycache__/
+public/data/
+.claude/settings.local.json
+state/
