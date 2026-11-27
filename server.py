@@ -36,18 +36,35 @@ _cache_lock = threading.Lock()
 _pool = ThreadPoolExecutor(max_workers=4)
 
 
-def fetch_json(path, **params):
+UPSTREAM_TIMEOUT = 10  # 초. 예약 사이트가 응답하지 않을 때 오래 붙잡혀 있지 않도록
+UPSTREAM_TRIES = 2
+
+
+def fetch_json(path, timeout=UPSTREAM_TIMEOUT, tries=UPSTREAM_TRIES, **params):
     url = BASE + path + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (yangbeol-court-viewer)"})
     last_err = None
-    for _ in range(3):
+    for _ in range(tries):
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
         except Exception as e:  # 네트워크 일시 오류 재시도
             last_err = e
             time.sleep(0.5)
-    raise RuntimeError(f"{path} 요청 실패: {last_err}")
+    raise RuntimeError(f"{path} 요청 실패: {type(last_err).__name__}: {last_err}")
+
+
+def diagnose():
+    """서버에서 예약 사이트에 접속되는지 확인 (배포 환경 점검용)."""
+    out = {"target": BASE, "checkedAt": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")}
+    t = time.time()
+    try:
+        data = fetch_json("rest/common/company", timeout=15, tries=1, type="F")
+        out.update(ok=True, seconds=round(time.time() - t, 2), sample=len(data) if isinstance(data, list) else data)
+    except Exception as e:
+        out.update(ok=False, seconds=round(time.time() - t, 2), error=str(e),
+                   hint="이 서버에서 예약 사이트에 접속하지 못합니다. 해외 접속 차단일 가능성이 큽니다.")
+    return out
 
 
 def get_courts():
@@ -225,7 +242,11 @@ class Handler(SimpleHTTPRequestHandler):
         if u.path == "/api/opening":
             with opening._lock:
                 state = opening.load_state()
-            return self.send_json(200, opening.summary(state, datetime.now(KST).replace(tzinfo=None)))
+            sm = opening.summary(state, datetime.now(KST).replace(tzinfo=None))
+            sm["lastError"] = LAST_OBS_ERROR if LAST_OBS_ERROR["error"] else None
+            return self.send_json(200, sm)
+        if u.path == "/api/diag":
+            return self.send_json(200, diagnose())
         if u.path == "/healthz":
             return self.send_json(200, {"ok": True})
         return super().do_GET()
@@ -245,15 +266,20 @@ def observe_once():
     return opening.observe(fetch_json, COMPANY, PART, OPEN_DAY_STATES, now)
 
 
+LAST_OBS_ERROR = {"error": None, "at": None}
+
+
 def observer_loop():
     """서버가 켜져 있는 동안 주기적으로 오픈 여부를 관측."""
     while True:
         wait = 3600
         try:
             state = observe_once()
+            LAST_OBS_ERROR.update(error=None, at=None)
             wait = opening.poll_interval(state, datetime.now(KST).replace(tzinfo=None))
         except Exception as e:
             sys.stderr.write(f"[관측 실패] {e}\n")
+            LAST_OBS_ERROR.update(error=str(e), at=datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"))
             wait = 600
         time.sleep(wait)
 

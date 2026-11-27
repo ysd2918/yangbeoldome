@@ -28,7 +28,7 @@
 
   async function fetchMonth(ym) {
     try {
-      const r = await fetch(`api/month?ym=${ym}`, { cache: "no-store" });
+      const r = await fetch(`api/month?ym=${ym}`, { cache: "no-store", signal: AbortSignal.timeout(90000) });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || r.status);
       return j;
@@ -78,8 +78,8 @@
     const b = $("opBadge");
     b.textContent = m.status === "대기" ? "예상 · 검증 대기" : m.status;
     b.className = "op-badge " + (BADGE[m.status] ?? "");
-    $("opNote").textContent = m.note ||
-      `규칙 "${op.rule.desc}" 로 계산. 예상일이 되면 실제로 열렸는지 자동 확인해서 맞으면 확정, 틀리면 새 규칙을 찾습니다.`;
+    $("opNote").textContent = (op.lastError ? `⚠ 관측 실패 (${op.lastError.at}): ${op.lastError.error} · ` : "") + (m.note ||
+      `규칙 "${op.rule.desc}" 로 계산. 예상일이 되면 실제로 열렸는지 자동 확인해서 맞으면 확정, 틀리면 새 규칙을 찾습니다.`);
 
     const li = [];
     li.push(`<li><b>현재 규칙:</b> ${op.rule.desc} <span class="op-badge ${op.rule.status === "확정" ? "ok" : "wait"}">${op.rule.status}</span>` +
@@ -137,7 +137,11 @@
       renderDetail();
     } catch (e) {
       st.className = "status err";
-      st.textContent = `불러오기 실패: ${e.message || e}`;
+      st.innerHTML = "";
+      st.append(`불러오기 실패: ${e.name === "TimeoutError" ? "90초 안에 응답 없음" : (e.message || e)} · `);
+      const a = document.createElement("a");
+      a.href = "api/diag"; a.target = "_blank"; a.textContent = "접속 진단 열기";
+      st.append(a);
     }
   }
 
