@@ -217,6 +217,12 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=PUBLIC_DIR, **kw)
 
+    def end_headers(self):
+        # 화면 파일을 고쳤을 때 브라우저가 예전 파일을 쓰지 않도록 매번 확인하게 함
+        if not self.path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (datetime.now(KST).strftime("%H:%M:%S"), fmt % args))
 
@@ -287,13 +293,18 @@ def observer_loop():
 def print_opening(state):
     sm = opening.summary(state, datetime.now(KST).replace(tzinfo=None))
     r = sm["rule"]
-    print(f"현재 규칙: {r['desc']} [{r['status']}] — {r['source']}")
-    for m in sm["months"]:
-        print(f"  {m['ym'][:4]}.{m['ym'][4:]}  예상 오픈 {m['predicted']}  [{m['status']}] {m['note']}")
-    if sm["lead"]:
-        L = sm["lead"]
-        print(f"사용 {L['days']}일 전까지: 관측 {L['count']}/{L['total']}회 일치 {L['all']}")
-    print(f"관측 {sm['obsCount']}회, 마지막: {sm['lastObs']['at'] if sm['lastObs'] else '-'}")
+    print(f"현재 규칙: {r['desc']} [{r['status']}] 적중 {r['hits']}/{r['checks']} — {r['source']}")
+    tw = sm["timeWindow"]
+    if tw:
+        print(f"오픈 시각: {tw['lo']}~{tw['hi']} 사이 ({tw['n']}건으로 좁힘)")
+    for u in sm["upcoming"]:
+        print(f"  {u['openDay']} 오픈 예정 → 사용일 {', '.join(t[4:6] + '/' + t[6:] for t in u['targets'])}")
+    lo = sm["lastObs"]
+    if lo:
+        print(f"지금 열린 날짜: {lo['open_dates'] or '없음'} · 사이트 이용가능일 {lo['period']}")
+    for line in sm["log"]:
+        print("  기록:", line)
+    print(f"관측 {sm['obsCount']}회, 마지막: {lo['at'] if lo else '-'}")
 
 
 def dump():

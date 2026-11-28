@@ -52,52 +52,56 @@
     }
   }
 
-  const BADGE = {
-    "확정": "ok", "대기": "wait", "당일 대기": "wait", "지켜보기 전": "wait",
-    "일치(범위 넓음)": "wide", "틀림": "bad", "검증불가": "", "추적 안 함": "",
-  };
   const fmtDate = (iso) => {
     const d = new Date(iso.slice(0, 10) + "T00:00:00");
-    return `${d.getMonth() + 1}월 ${d.getDate()}일(${DOW[d.getDay()]})`;
+    return `${d.getMonth() + 1}/${d.getDate()}(${DOW[d.getDay()]})`;
   };
+  const fmtYmd = (k) => fmtDate(`${k.slice(0, 4)}-${k.slice(4, 6)}-${k.slice(6)}`);
   const fmtAt = (iso) => iso ? iso.slice(5, 16).replace("-", "/").replace("T", " ") : "-";
+  const isoToday = `${today.slice(0, 4)}-${today.slice(4, 6)}-${today.slice(6)}`;
+
+  // 사용일(YYYYMMDD) → 규칙상 온라인 오픈일(YYYYMMDD)
+  function openDayOf(ymd) {
+    const r = state.opening?.rule;
+    if (!r) return null;
+    const d = new Date(+ymd.slice(0, 4), +ymd.slice(4, 6) - 1, +ymd.slice(6) - r.lead_max);
+    return ymdOf(d);
+  }
 
   function renderOpening() {
     const op = state.opening, box = $("opening");
     if (!op) { box.hidden = true; return; }
-    // 보고 있는 달 → 없으면 다음 달
-    let m = op.months.find((x) => x.ym === state.ym && x.status !== "추적 안 함");
-    if (!m) m = op.months.find((x) => x.ym === addMonths(baseYm, 1));
-    if (!m) { box.hidden = true; return; }
     box.hidden = false;
-    const mon = +m.ym.slice(4);
-    const opened = !!m.firstOpenAt;
-    $("opTitle").textContent = opened
-      ? `${mon}월 온라인 예약 오픈 확인: ${fmtAt(m.firstOpenAt)} 관측`
-      : `${mon}월 온라인 예약 오픈 예상: ${fmtDate(m.predicted)}${op.rule.time ? " " + op.rule.time : ""}`;
+    const r = op.rule, tw = op.timeWindow;
+    $("opTitle").textContent = `온라인 예약 규칙: ${r.desc}`;
     const b = $("opBadge");
-    b.textContent = m.status === "대기" ? "예상 · 검증 대기" : m.status;
-    b.className = "op-badge " + (BADGE[m.status] ?? "");
-    $("opNote").textContent = (op.lastError ? `⚠ 관측 실패 (${op.lastError.at}): ${op.lastError.error} · ` : "") + (m.note ||
-      `규칙 "${op.rule.desc}" 로 계산. 예상일이 되면 실제로 열렸는지 자동 확인해서 맞으면 확정, 틀리면 새 규칙을 찾습니다.`);
+    b.textContent = r.status === "확정" ? `확정 · 적중 ${r.hits}회` : `${r.status} · 적중 ${r.hits}/${r.checks}`;
+    b.className = "op-badge " + (r.status === "확정" ? "ok" : r.status.startsWith("학습") ? "wide" : "wait");
+
+    const parts = [];
+    if (op.lastError) parts.push(`⚠ 관측 실패 (${op.lastError.at}): ${op.lastError.error}`);
+    const lo = op.lastObs;
+    if (lo && lo.at.slice(0, 10) === isoToday) {
+      parts.push(`지금 열린 날: ${lo.open_dates.length ? lo.open_dates.map(fmtYmd).join(", ") : "없음"}`);
+    }
+    const tm = op.upcoming.find((u) => u.openDay > isoToday);
+    if (tm) parts.push(`${fmtDate(tm.openDay)} 오픈 예정: ${tm.targets.map(fmtYmd).join(", ")} 사용분`);
+    parts.push(tw ? `오픈 시각 ${tw.lo}~${tw.hi} 사이 (${tw.n}건으로 좁힘)` : "오픈 시각 관측 중");
+    $("opNote").textContent = parts.join(" · ");
 
     const li = [];
-    li.push(`<li><b>현재 규칙:</b> ${op.rule.desc} <span class="op-badge ${op.rule.status === "확정" ? "ok" : "wait"}">${op.rule.status}</span>` +
-      (op.rule.matches ? ` · 적중 ${op.rule.matches}회` : "") + `<br><span class="muted">${op.rule.source}</span></li>`);
-    if (op.lead) {
-      const L = op.lead;
-      li.push(`<li><b>신청 마감:</b> 사용 ${L.days}일 전까지 — 관측 ${L.count}/${L.total}회 일치` +
-        (L.count < L.total ? ` <span class="muted">(다른 값: ${JSON.stringify(L.all)})</span>` : "") + "</li>");
+    li.push(`<li><b>근거:</b> ${r.source}<br><span class="muted">관측할 때마다 실제 열린 날짜와 비교해서 서로 다른 2일 이상, 3회 적중하면 확정합니다. 같은 불일치가 2번 연속 나오면 새 규칙으로 바꿉니다.</span></li>`);
+    if (op.pending) li.push(`<li><b>새 규칙 후보:</b> 사용일 ${op.pending.lead_max}일 전 ~ ${op.pending.lead_min}일 전 (연속 ${op.pending.count}회 관측)</li>`);
+    li.push("<li><b>앞으로 오픈 예정:</b> " + op.upcoming.filter((u) => u.openDay >= isoToday)
+      .map((u) => `${fmtDate(u.openDay)} → ${u.targets.map(fmtYmd).join(", ")}`).join(" · ") + "</li>");
+    if (op.recent.length) {
+      li.push("<li><b>날짜별 오픈 확인:</b><ul>" + op.recent.map((x) =>
+        `<li>${fmtYmd(x.date)} 사용분 — ${x.status || ""}${x.window ? ` <span class="muted">(${x.window} 사이 열림)</span>` : ""}</li>`).join("") + "</ul></li>");
     }
-    op.months.filter((x) => x.status !== "추적 안 함").forEach((x) => {
-      li.push(`<li>${x.ym.slice(0, 4)}.${x.ym.slice(4)} — 예상 ${fmtDate(x.predicted)} · <b>${x.status}</b>` +
-        (x.note ? ` <span class="muted">${x.note}</span>` : "") + "</li>");
-    });
-    op.history.forEach((h) => {
-      li.push(`<li class="muted">폐기된 규칙: ${h.desc} (${h.retired_by} 관측과 불일치)</li>`);
-    });
-    li.push(`<li class="muted">관측 ${op.obsCount}회 · 마지막 확인 ${fmtAt(op.lastObs?.at)}` +
-      (op.lastObs?.period ? ` · 사이트 이용가능일 ${op.lastObs.period}` : "") + "</li>");
+    op.history.forEach((h) => li.push(`<li class="muted">폐기된 규칙: ${h.desc} (${fmtAt(h.retired_at)})</li>`));
+    if (op.log.length) li.push("<li><b>기록:</b><ul>" + op.log.map((l) => `<li class="muted">${l}</li>`).join("") + "</ul></li>");
+    li.push(`<li class="muted">관측 ${op.obsCount}회 · 마지막 확인 ${fmtAt(lo?.at)}` +
+      (lo?.period ? ` · 사이트 이용가능일 ${lo.period}` : "") + " · 서버가 켜져 있으면 30분마다 확인</li>");
     $("opRules").innerHTML = li.join("");
   }
 
@@ -108,6 +112,7 @@
       state.opening = null;
     }
     renderOpening();
+    if (state.data) renderCalendar();
   }
 
   async function load(force) {
@@ -191,7 +196,7 @@
       const btn = document.createElement("button");
       btn.className = `day ${kind}` + (dow === 0 ? " sun" : dow === 6 ? " sat" : "") +
         (ymd === today ? " today" : "") + (ymd === state.selected ? " selected" : "");
-      let badge = "", hours = "";
+      let badge = "", hours = "", opens = "";
       if (d && kind !== "blank") {
         if (kind === "closed") badge = "휴관";
         else if (kind === "past") badge = "지남";
@@ -202,10 +207,15 @@
           const h = freeHours(d);
           hours = h.join("·") + "시";
         }
+        const od = openDayOf(ymd);
+        if (od && od > today && kind !== "has-open" && kind !== "closed" && kind !== "past") {
+          opens = `${+od.slice(4, 6)}/${+od.slice(6)} 오픈`;
+        }
       }
       btn.innerHTML = `<span class="n">${day}</span>` +
         (badge ? `<span class="badge">${badge}</span>` : "") +
-        (hours ? `<span class="hours">${hours}</span>` : "");
+        (hours ? `<span class="hours">${hours}</span>` : "") +
+        (opens ? `<span class="opens">${opens}</span>` : "");
       if (title) btn.title = title;
       btn.setAttribute("aria-label", `${m}월 ${day}일 ${badge.replace(/<[^>]+>/g, "")}`);
       if (d) btn.addEventListener("click", () => {

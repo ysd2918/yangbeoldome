@@ -1,17 +1,18 @@
-"""온라인 수시대관 오픈일 예측 · 검증 · 규칙 학습
+"""온라인 수시대관 오픈 규칙 예측 · 검증 · 학습 (날짜별 모델)
 
-동작 방식
-1. 가설 규칙으로 다음 달의 '예상 오픈일'을 계산한다. (기본: 해당 월 1일)
-2. 주기적으로 사이트를 관측한다. (place_detail 의 이용가능일 + 1번 코트 날짜 상태)
-   - 아직 안 열렸으면 '마지막으로 닫혀 있던 시각'을 기록
-   - 처음 열린 걸 보면 '처음 열린 시각'을 기록
-3. 실제 오픈 시점 범위 [마지막 닫힘, 처음 열림] 과 예상일을 비교
-   - 예상일과 맞고 범위가 하루 이내 → 규칙 '확정'
-   - 예상일이 범위 안이지만 범위가 넓음 → '일치(범위 넓음)' (모순은 없지만 확정은 보류)
-   - 예상일이 범위 밖 → '틀림' → 관측된 실제 오픈일로 새 규칙을 만들고 다음 달에 다시 검증
-4. 이용가능일(period) 시작일 - 오늘 = '사용 N일 전까지' 규칙도 매번 집계한다.
+관측 결과 (2026-11-28): 달 전체가 한꺼번에 열리는 게 아니라, 12/1 하루만 '예약가능'이 되었다.
+그래서 규칙을 "사용일 기준 N일 전에 열린다"로 표현한다.
+
+  규칙 = 오늘 기준 [lead_min, lead_max]일 뒤 날짜만 온라인 신청 가능
+         (lead_min == lead_max == 3 이면 '사용일 3일 전 하루만 신청 가능')
+
+동작
+1. 관측할 때마다 1번 코트의 날짜 상태(이번 달·다음 달)를 받아 '열린 날짜' 목록을 만든다.
+2. 규칙으로 계산한 '열려야 할 날짜'(휴관일 제외)와 비교한다.
+   - 같으면 적중. 서로 다른 2일 이상, 3회 이상 적중하면 '확정'.
+   - 다르면 같은 패턴이 2번 연속 나올 때 새 규칙으로 교체한다. (날짜가 바뀌는 순간에 잘못 관측하는 경우를 거르기 위해)
+3. 각 날짜가 '닫힘 → 열림'으로 바뀐 시각 범위를 모아 오픈 시각(예: 00:00~09:10 사이)을 좁혀 나간다.
 """
-import calendar
 import json
 import os
 import threading
@@ -20,20 +21,33 @@ from datetime import date, datetime, timedelta
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 OBS_FILE = os.path.join(STATE_DIR, "observations.jsonl")
 STATE_FILE = os.path.join(STATE_DIR, "opening_state.json")
+STATE_VERSION = 2
 _lock = threading.Lock()
 
 DEFAULT_RULE = {
-    "id": "default-1st",
-    "month_delta": 0,  # 0 = 해당 월, -1 = 전월
-    "day": 1,
+    "lead_min": 3,
+    "lead_max": 3,
     "status": "예상",
-    "source": "가설: 현장 신청 '당월 상시' 안내 + 사이트 이용가능일 설정으로 추정",
-    "time": None,
-    "matches": 0,
+    "source": "11/28 관측: 12/1만 예약가능으로 바뀜, 사이트 이용가능일 시작 = 오늘+3일",
+    "since": None,
+    "checks": 0,
+    "hits": 0,
+    "hit_days": [],
 }
+CONFIRM_HITS = 3
+CONFIRM_DAYS = 2
+SWITCH_AFTER = 2  # 같은 불일치 패턴이 연속 몇 번이면 규칙 교체
 
 
-# ---------- 날짜 유틸 ----------
+# ---------- 유틸 ----------
+def ymd(d):
+    return d.strftime("%Y%m%d")
+
+
+def from_ymd(s):
+    return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+
+
 def ym_of(d):
     return f"{d.year}{d.month:02d}"
 
@@ -43,49 +57,39 @@ def add_month(ym, n):
     return f"{y + m // 12}{m % 12 + 1:02d}"
 
 
-def month_first(ym):
-    return date(int(ym[:4]), int(ym[4:]), 1)
+def describe(rule):
+    a, b = rule["lead_min"], rule["lead_max"]
+    if a == b:
+        return f"사용일 {a}일 전 하루만 온라인 신청 가능"
+    return f"사용일 {b}일 전 ~ {a}일 전 온라인 신청 가능"
 
 
-def month_last(ym):
-    y, m = int(ym[:4]), int(ym[4:])
-    return date(y, m, calendar.monthrange(y, m)[1])
+def expected_open(rule, today, months, closed_dates):
+    """규칙상 지금 열려 있어야 할 날짜 (관측한 달 범위 안, 휴관일 제외)."""
+    out = set()
+    for k in range(rule["lead_min"], rule["lead_max"] + 1):
+        d = ymd(today + timedelta(days=k))
+        if d[:6] in months and d not in closed_dates:
+            out.add(d)
+    return out
 
 
-def parse_period(p):
-    try:
-        a, b = p.split("~")
-        return date.fromisoformat(a.strip()), date.fromisoformat(b.strip())
-    except Exception:
-        return None
-
-
-def describe_rule(rule):
-    where = "해당 월" if rule["month_delta"] == 0 else "전월" if rule["month_delta"] == -1 else f"{rule['month_delta']}개월"
-    s = f"{where} {rule['day']}일 오픈"
-    if rule.get("time"):
-        s += f" ({rule['time']})"
-    return s
-
-
-def predicted_open(rule, ym):
-    base = add_month(ym, rule["month_delta"])
-    last = month_last(base).day
-    return month_first(base).replace(day=min(rule["day"], last))
-
-
-# ---------- 상태 저장 ----------
+# ---------- 상태 ----------
 def new_state():
-    return {"rule": dict(DEFAULT_RULE), "history": [], "months": {}, "lead": {}, "end": {},
-            "last_obs": None, "obs_count": 0}
+    return {"version": STATE_VERSION, "rule": dict(DEFAULT_RULE), "history": [], "pending": None,
+            "dates": {}, "time_window": None, "lead_period": {}, "offsets": {},
+            "last_obs": None, "obs_count": 0, "log": []}
 
 
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            s = json.load(f)
+        if s.get("version") == STATE_VERSION:
+            return s
     except FileNotFoundError:
-        return new_state()
+        pass
+    return rebuild_state()
 
 
 def save_state(state):
@@ -96,130 +100,171 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
+def rebuild_state():
+    """관측 기록 파일을 처음부터 다시 적용해서 상태를 만든다."""
+    state = new_state()
+    try:
+        with open(OBS_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    obs = json.loads(line)
+                    if "open_dates" in obs:
+                        apply(state, obs)
+    except FileNotFoundError:
+        pass
+    return state
+
+
 # ---------- 관측 ----------
 def collect(fetch_json, company, part, open_states, now):
-    """사이트에서 관측값 하나를 만든다 (요청 3번)."""
     detail = fetch_json("rest/facilities/place_detail", company_code=company, part_code=part, place_code="25")
     cur = ym_of(now.date())
-    obs = {"at": now.isoformat(timespec="seconds"), "period": detail.get("period", ""),
-           "receipt": detail.get("receipt_period", ""), "open_days": {}}
-    for ym in (cur, add_month(cur, 1)):
+    months = [cur, add_month(cur, 1)]
+    open_dates, closed_dates = [], []
+    for ym in months:
         days = fetch_json("rest/facilities/place_month_state_list", company_code=company, part_code=part,
                           place_code="25", base_date=ym + "01", rent_type="1001", mem_no="")
-        if not isinstance(days, list):
-            days = []
-        obs["open_days"][ym] = sum(1 for d in days
-                                   if d["date"].replace("-", "").startswith(ym) and d.get("state_cd") in open_states)
-    return obs
+        for d in days if isinstance(days, list) else []:
+            key = d["date"].replace("-", "")
+            if key[:6] != ym:
+                continue
+            if d.get("state_cd") in open_states:
+                open_dates.append(key)
+            elif d.get("state_cd") == "30":
+                closed_dates.append(key)
+    return {"at": now.isoformat(timespec="seconds"), "period": detail.get("period", ""),
+            "receipt": detail.get("receipt_period", ""), "months": months,
+            "open_dates": sorted(open_dates), "closed_dates": sorted(closed_dates)}
 
 
-def month_is_open(obs, ym):
-    if obs["open_days"].get(ym, 0) > 0:
-        return True
-    pr = parse_period(obs.get("period", ""))
-    return bool(pr and pr[0] <= pr[1] and pr[1] >= month_first(ym) and pr[0] <= month_last(ym))
+def _log(state, now, msg):
+    state["log"].append(f"{now:%m/%d %H:%M} {msg}")
+    state["log"] = state["log"][-30:]
 
 
 def apply(state, obs):
-    """관측값 하나를 상태에 반영 (예측 검증 / 규칙 학습)."""
     now = datetime.fromisoformat(obs["at"])
     today = now.date()
-    cur = ym_of(today)
-    nxt = add_month(cur, 1)
     state["obs_count"] += 1
     state["last_obs"] = obs
+    months = set(obs.get("months") or [ym_of(today), add_month(ym_of(today), 1)])
+    opened = set(obs["open_dates"])
+    closed = set(obs.get("closed_dates", []))
 
-    # '사용 N일 전까지' / 신청 가능 마지막 날 규칙 집계
-    pr = parse_period(obs.get("period", ""))
-    if pr:
-        lead = str((pr[0] - today).days)
-        state["lead"][lead] = state["lead"].get(lead, 0) + 1
-        if pr[0] <= pr[1]:
-            key = "말일" if pr[1] == month_last(ym_of(pr[1])) else f"오늘+{(pr[1] - today).days}일"
-            state["end"][key] = state["end"].get(key, 0) + 1
+    # 사이트 이용가능일 시작 = 오늘 + N  (참고 지표)
+    try:
+        start = date.fromisoformat(obs["period"].split("~")[0].strip())
+        k = str((start - today).days)
+        state["lead_period"][k] = state["lead_period"].get(k, 0) + 1
+    except Exception:
+        pass
+    for d in opened:
+        k = str((from_ymd(d) - today).days)
+        state["offsets"][k] = state["offsets"].get(k, 0) + 1
 
-    for ym in (cur, nxt):
-        m = state["months"].get(ym)
-        if m is None:
-            if ym != nxt:
-                continue  # 미리 지켜보기 시작한 달만 검증 대상
-            P = predicted_open(state["rule"], ym)
-            m = state["months"][ym] = {
-                "ym": ym, "predicted": P.isoformat(), "rule_id": state["rule"]["id"],
-                "status": "대기", "last_closed_at": None, "first_open_at": None, "note": "",
-            }
-        if m["first_open_at"]:
-            continue
-        P = date.fromisoformat(m["predicted"])
-        if not month_is_open(obs, ym):
-            m["last_closed_at"] = obs["at"]
-            if today > P:
-                m["status"] = "틀림"
-                m["note"] = f"예상일({P:%m/%d})이 지났는데 아직 안 열림 — 열리는 시점을 계속 관측 중"
-            elif today == P:
-                m["status"] = "당일 대기"
-                m["note"] = "예상일 당일, 아직 안 열림 (오픈 시각 미정)"
-            else:
-                m["status"] = "대기"
-                m["note"] = ""
-        else:
-            m["first_open_at"] = obs["at"]
-            evaluate(state, m)
+    check_rule(state, now, today, months, opened, closed)
+    track_dates(state, now, today, months, opened)
 
 
-def evaluate(state, m):
-    P = date.fromisoformat(m["predicted"])
-    fo = datetime.fromisoformat(m["first_open_at"])
-    if not m["last_closed_at"]:
-        m["status"] = "검증불가"
-        m["note"] = "관측을 시작했을 때 이미 열려 있었음"
-        return
-    lc = datetime.fromisoformat(m["last_closed_at"])
-    lo, hi = lc.date(), fo.date()
-    window = f"{lc:%m/%d %H:%M} ~ {fo:%m/%d %H:%M} 사이 오픈"
+def check_rule(state, now, today, months, opened, closed):
     rule = state["rule"]
-
-    if lo <= P <= hi:
-        # 예상일 당일에 열린 걸 봤고, 마지막 닫힘이 당일 또는 전날 18시 이후면 하루 단위로 확정
-        if hi == P and (lo == P or (lo == P - timedelta(days=1) and lc.hour >= 18)):
-            m["status"] = "확정"
-            m["note"] = window + " — 예상과 일치"
-            if rule["id"] == m["rule_id"]:
-                rule["matches"] += 1
-                rule["status"] = "확정"
-                if lo == hi:
-                    rule["time"] = f"{lc:%H:%M}~{fo:%H:%M} 사이"
-        else:
-            m["status"] = "일치(범위 넓음)"
-            m["note"] = window + " — 예상과 모순은 없지만 하루 단위로 확인 못 함"
+    expected = expected_open(rule, today, months, closed)
+    if not expected and not opened:
+        return  # 휴관일 등으로 비교할 게 없음
+    if opened == expected:
+        rule["checks"] += 1
+        rule["hits"] += 1
+        if today.isoformat() not in rule["hit_days"]:
+            rule["hit_days"] = (rule["hit_days"] + [today.isoformat()])[-10:]
+        state["pending"] = None
+        if rule["status"] != "확정" and rule["hits"] >= CONFIRM_HITS and len(rule["hit_days"]) >= CONFIRM_DAYS:
+            rule["status"] = "확정"
+            _log(state, now, f"규칙 확정: {describe(rule)} (적중 {rule['hits']}회)")
         return
 
-    # 틀림 → 새 규칙 학습
-    m["status"] = "틀림"
-    m["note"] = window + f" — 예상일({P:%m/%d})과 다름, 새 규칙 학습"
-    D = hi
-    approx = lo != hi and not (hi - lo).days <= 1
-    delta = (D.year - int(m["ym"][:4])) * 12 + D.month - int(m["ym"][4:])
-    old = dict(rule)
-    old["status"] = "틀림"
-    old["retired_by"] = m["ym"]
-    state["history"].append(old)
-    new = {
-        "id": f"learned-{m['ym']}",
-        "month_delta": delta,
-        "day": D.day,
-        "status": "학습됨(다음 달 검증 대기)" + (" · 날짜 추정" if approx else ""),
-        "source": f"{m['ym'][:4]}.{m['ym'][4:]} 실제 오픈 관측: {window}",
-        "time": f"{lc:%H:%M}~{fo:%H:%M} 사이" if lo == hi else None,
-        "matches": 0,
-    }
-    state["rule"] = new
-    for other in state["months"].values():  # 아직 안 열린 달 다시 예측
-        if not other["first_open_at"] and other["ym"] != m["ym"]:
-            other["predicted"] = predicted_open(new, other["ym"]).isoformat()
-            other["rule_id"] = new["id"]
-            other["status"] = "대기"
-            other["note"] = ""
+    if not opened:
+        # 아직 오늘 오픈 시각 전이거나 점검/전부 마감 → 판정 보류 (적중/불일치에 넣지 않음)
+        return
+    rule["checks"] += 1
+    offs = sorted((from_ymd(d) - today).days for d in opened)
+    cand = {"lead_min": offs[0], "lead_max": offs[-1]}
+    _log(state, now, f"불일치: 예상 {sorted(expected)} / 실제 {sorted(opened)} (오늘+{offs}일)")
+    p = state["pending"]
+    if p and p["lead_min"] == cand["lead_min"] and p["lead_max"] == cand["lead_max"]:
+        p["count"] += 1
+    else:
+        p = state["pending"] = {**cand, "count": 1, "first_seen": now.isoformat(timespec="seconds")}
+    if p["count"] >= SWITCH_AFTER:
+        old = dict(rule)
+        old["retired_at"] = now.isoformat(timespec="seconds")
+        old["desc"] = describe(old)
+        state["history"].append(old)
+        state["rule"] = {**DEFAULT_RULE, **cand, "status": "학습됨(검증 대기)",
+                         "source": f"{p['first_seen'][5:16].replace('T', ' ')}부터 {p['count']}회 연속 관측: 오늘+{offs}일 날짜가 열림",
+                         "since": now.isoformat(timespec="seconds"), "checks": 0, "hits": 0, "hit_days": []}
+        state["pending"] = None
+        state["time_window"] = None
+        _log(state, now, f"새 규칙 학습: {describe(state['rule'])}")
+
+
+def track_dates(state, now, today, months, opened):
+    """각 날짜가 닫힘→열림으로 바뀐 시각을 기록하고 오픈 시각 범위를 좁힌다."""
+    rule = state["rule"]
+    horizon = today + timedelta(days=rule["lead_max"] + 3)
+    d = today
+    while d <= horizon:
+        key = ymd(d)
+        if key[:6] in months:
+            rec = state["dates"].get(key)
+            if key in opened:
+                if not rec:
+                    state["dates"][key] = {"first_open_at": now.isoformat(timespec="seconds"),
+                                           "status": "관측 전에 이미 열림"}
+                elif rec.get("last_closed_at") and not rec.get("first_open_at"):
+                    rec["first_open_at"] = now.isoformat(timespec="seconds")
+                    resolve_date(state, key, rec)
+            elif d >= today + timedelta(days=rule["lead_min"]):
+                # 아직 열리기 전인 날짜 (이미 신청 기간이 지난 날짜는 제외)
+                rec = state["dates"].setdefault(key, {})
+                if not rec.get("first_open_at"):
+                    rec["last_closed_at"] = now.isoformat(timespec="seconds")
+        d += timedelta(days=1)
+    # 오래된 기록 정리
+    cutoff = ymd(today - timedelta(days=40))
+    state["dates"] = {k: v for k, v in state["dates"].items() if k >= cutoff}
+
+
+def resolve_date(state, key, rec):
+    rule = state["rule"]
+    lc = datetime.fromisoformat(rec["last_closed_at"])
+    fo = datetime.fromisoformat(rec["first_open_at"])
+    pred = from_ymd(key) - timedelta(days=rule["lead_max"])
+    rec["predicted"] = pred.isoformat()
+    rec["window"] = f"{lc:%m/%d %H:%M} ~ {fo:%m/%d %H:%M}"
+    if not (lc.date() <= pred <= fo.date()):
+        rec["status"] = "예상일과 다름"
+        return
+    if fo.date() != pred:
+        rec["status"] = "일치(범위 넓음)"
+        return
+    rec["status"] = "예상일에 오픈"
+    if lc.date() == pred:
+        lo = lc.strftime("%H:%M")
+    elif lc.date() == pred - timedelta(days=1):
+        lo = "00:00"
+    else:
+        return  # 관측 공백이 길어 시각은 못 좁힘
+    hi = fo.strftime("%H:%M")
+    tw = state["time_window"]
+    if tw:
+        nlo, nhi = max(tw["lo"], lo), min(tw["hi"], hi)
+        if nlo <= nhi:
+            state["time_window"] = {"lo": nlo, "hi": nhi, "n": tw["n"] + 1}
+        else:  # 서로 모순되면 최신 값으로 다시 시작
+            state["time_window"] = {"lo": lo, "hi": hi, "n": 1}
+    else:
+        state["time_window"] = {"lo": lo, "hi": hi, "n": 1}
 
 
 def observe(fetch_json, company, part, open_states, now):
@@ -235,45 +280,31 @@ def observe(fetch_json, company, part, open_states, now):
 
 
 def poll_interval(state, now):
-    """예상일 전후에는 10분, 평소에는 1시간 간격."""
-    today = now.date()
-    for m in state["months"].values():
-        if m["first_open_at"]:
-            continue
-        P = date.fromisoformat(m["predicted"])
-        if P - timedelta(days=1) <= today or m["status"] == "틀림":
-            return 600
-    return 3600
+    """오픈 시각을 좁히기 위해 30분 간격으로 관측."""
+    return 1800
 
 
 def summary(state, now):
-    """화면용 요약."""
     today = now.date()
     rule = state["rule"]
-    cur = ym_of(today)
+    tw = state["time_window"]
     upcoming = []
-    for i in range(0, 3):
-        ym = add_month(cur, i)
-        m = state["months"].get(ym)
-        upcoming.append({
-            "ym": ym,
-            "predicted": m["predicted"] if m else predicted_open(rule, ym).isoformat(),
-            "status": m["status"] if m else ("지켜보기 전" if i else "추적 안 함"),
-            "note": m["note"] if m else "",
-            "firstOpenAt": m["first_open_at"] if m else None,
-            "lastClosedAt": m["last_closed_at"] if m else None,
-        })
-    total = sum(state["lead"].values())
-    lead = None
-    if total:
-        top, cnt = max(state["lead"].items(), key=lambda kv: kv[1])
-        lead = {"days": int(top), "count": cnt, "total": total, "all": state["lead"]}
+    for i in range(0, 4):
+        day = today + timedelta(days=i)
+        targets = [ymd(day + timedelta(days=k)) for k in range(rule["lead_min"], rule["lead_max"] + 1)]
+        upcoming.append({"openDay": day.isoformat(), "targets": targets})
+    recent = sorted(((k, v) for k, v in state["dates"].items() if v.get("first_open_at")), reverse=True)[:6]
+    lp = state["lead_period"]
     return {
-        "rule": {**rule, "desc": describe_rule(rule)},
-        "history": [{**h, "desc": describe_rule(h)} for h in state["history"]],
-        "months": upcoming,
-        "lead": lead,
-        "end": state["end"],
+        "rule": {**rule, "desc": describe(rule)},
+        "timeWindow": tw,
+        "pending": state["pending"],
+        "history": state["history"],
+        "upcoming": upcoming,
+        "recent": [{"date": k, **v} for k, v in recent],
+        "offsets": state["offsets"],
+        "leadPeriod": lp,
+        "log": state["log"][-8:],
         "lastObs": state["last_obs"],
         "obsCount": state["obs_count"],
     }
