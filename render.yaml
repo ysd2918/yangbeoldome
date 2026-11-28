@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: yangbeol-court
-    runtime: python
-    region: singapore
-    plan: free
-    buildCommand: "echo no build"
-    startCommand: "python server.py"
-    healthCheckPath: /healthz

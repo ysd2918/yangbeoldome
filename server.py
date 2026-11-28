@@ -2,7 +2,7 @@
 
 외부 패키지 없이 Python 표준 라이브러리만 사용한다.
 
-  python server.py              # http://localhost:8000 에서 웹앱 실행
+  python server.py [--open]     # http://localhost:8765 에서 웹앱 실행 (--open: 브라우저 자동 열기)
   python server.py --dump       # public/data/YYYYMM.json 생성 (정적 호스팅용, 이번 달+다음 달)
   python server.py --observe    # 예약 오픈 여부를 한 번 관측하고 예측/검증 결과 출력 (작업 스케줄러용)
 """
@@ -316,7 +316,11 @@ if __name__ == "__main__":
         print_opening(observe_once())
     else:
         threading.Thread(target=observer_loop, daemon=True).start()
-        port = int(os.environ.get("PORT", "8000"))
-        srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-        print(f"양벌 테니스 돔 빈 코트 찾기: http://localhost:{port}")
+        port = int(os.environ.get("PORT", "8765"))
+        host = os.environ.get("HOST", "127.0.0.1")  # 이 PC에서만 접속
+        srv = ThreadingHTTPServer((host, port), Handler)
+        print(f"양벌 테니스 돔 빈 코트 찾기: http://localhost:{port}  (창을 닫으면 종료)")
+        if "--open" in sys.argv:
+            import webbrowser
+            threading.Timer(1.0, webbrowser.open, args=(f"http://localhost:{port}",)).start()
         srv.serve_forever()

@@ -5,7 +5,7 @@
       "name": "yangbeol",
       "runtimeExecutable": "python",
       "runtimeArgs": ["server.py"],
-      "port": 8000
+      "port": 8765
     }
   ]
 }
